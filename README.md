@@ -98,6 +98,66 @@ galph run
 #   ▶ Replanning phase (inputs changed, preserving 2 completed tasks)
 ```
 
+## Recovery & interactive fixes
+
+If galph misses part of the spec or produces broken code, you have several ways to recover:
+
+### Re-run galph (retry failed tasks)
+
+Failed tasks are retried on the next run. If the failure was transient, this is often enough:
+
+```bash
+galph run
+```
+
+The `max_consecutive_failures` setting (default 3) prevents infinite retry loops.
+
+### Refine the PRD and re-run (replan)
+
+Clarify or fix the spec, then let smart change detection handle the rest:
+
+```bash
+vim PRD.md          # fix the ambiguous requirement
+galph run           # detects hash change → replans, preserving completed tasks
+```
+
+This is the cleanest path — galph keeps everything that already passed and only plans the remaining/new work.
+
+### Fix code interactively, then resume
+
+Launch klaudia (or Claude Code) directly in your workspace for surgical fixes:
+
+```bash
+cd my-project
+CLAUDECODE= node ../klaudia/dist/cli.js    # interactive klaudia session
+# or use Claude Code if installed
+```
+
+Then resume galph for the remaining tasks:
+
+```bash
+galph run           # picks up where it left off, your manual fix is in place
+```
+
+Since galph commits per-task, your manual edits sit cleanly on top of completed work.
+
+### Fix code manually
+
+For small issues, just edit the file yourself:
+
+```bash
+vim cmd/server/main.go    # fix the bug
+galph run                 # continues with remaining tasks
+```
+
+### Recommended recovery workflow
+
+1. **First try**: just `galph run` again (retry)
+2. **Spec was unclear**: edit PRD.md → `galph run` (triggers replan)
+3. **Need precision**: launch klaudia interactively, fix it, then `galph run` for remaining tasks
+
+All paths converge — galph picks up the current state and keeps going.
+
 ## Klaudia setup
 
 galph needs a built copy of [Klaudia](../klaudia/) — the Claude Code fork that does the actual coding work. Klaudia is mounted read-only into the Docker container at `/klaudia`.
