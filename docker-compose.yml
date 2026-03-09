@@ -1,0 +1,23 @@
+services:
+  klaudia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: galph-klaudia
+    volumes:
+      # Klaudia workspace (sibling directory)
+      - ../klaudia:/workspace
+      # Claude config + auth (read/write for session persistence)
+      - ~/.claude:/home/node/.claude
+      # galph state directory
+      - .galph:/home/node/.galph
+    working_dir: /workspace
+    # Keep container alive for exec
+    entrypoint: ["sleep", "infinity"]
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    # Network: use host for simplicity, or bridge for isolation
+    network_mode: host
