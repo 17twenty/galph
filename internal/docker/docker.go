@@ -21,10 +21,9 @@ var envVarsToForward = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
-	"CLAUDE_CODE_USE_BEDROCK",
-	"CLAUDE_CODE_USE_VERTEX",
-	"CLAUDE_CODE_USE_FOUNDRY",
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+	"KLAUDIA_CUSTOM_MODEL",
+	"KLAUDIA_CUSTOM_ENDPOINT",
 }
 
 // ContainerName generates a unique, deterministic container name from the project
@@ -87,6 +86,14 @@ func NewContainer(name, image, workspace, klaudiaDir, claudeDir, galphDir, memor
 		Memory:     memory,
 		Network:    network,
 	}, nil
+}
+
+// WorkspacePath returns the workspace path as seen inside the container.
+func (c *Container) WorkspacePath() string { return "/workspace" }
+
+// KlaudiaCmd returns the command to invoke klaudia inside the container.
+func (c *Container) KlaudiaCmd() []string {
+	return []string{"node", "/klaudia/dist/cli.js"}
 }
 
 // Build builds the Docker image from a Dockerfile.

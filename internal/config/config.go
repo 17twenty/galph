@@ -17,6 +17,7 @@ type Config struct {
 	MaxConsecutiveFailures int          `json:"max_consecutive_failures"`
 	TestCommand            string       `json:"test_command"`
 	Model                  string       `json:"model"`
+	Mode                   string       `json:"mode"` // "docker" (default) or "local"
 	Docker                 DockerConfig `json:"docker"`
 	DryRun                 bool         `json:"dry_run"`
 	Verbose                bool         `json:"verbose"`
@@ -39,6 +40,7 @@ func DefaultConfig() *Config {
 		MaxConsecutiveFailures: 3,
 		TestCommand:            "",
 		Model:                  "claude-sonnet-4-6",
+		Mode:                   "docker",
 		Docker: DockerConfig{
 			Image:   "galph-klaudia",
 			Memory:  "4g",

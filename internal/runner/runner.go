@@ -14,17 +14,19 @@ import (
 	"galph/internal/config"
 	"galph/internal/display"
 	"galph/internal/docker"
+	"galph/internal/executor"
 	"galph/internal/hasher"
+	"galph/internal/local"
 	"galph/internal/parser"
 	"galph/internal/state"
 )
 
 // Runner orchestrates the galph loop.
 type Runner struct {
-	cfg       *config.Config
-	container *docker.Container
-	store     *state.Store
-	log       func(format string, args ...any)
+	cfg  *config.Config
+	exec executor.Executor
+	store *state.Store
+	log   func(format string, args ...any)
 }
 
 // New creates a runner from config.
@@ -53,36 +55,45 @@ func New(cfg *config.Config, logFn func(string, ...any)) (*Runner, error) {
 	}
 	logFn("klaudia found at %s", klaudiaDir)
 
-	// Resolve claude dir
-	home, _ := os.UserHomeDir()
-	claudeDir := filepath.Join(home, ".claude")
-	if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
-		os.MkdirAll(claudeDir, 0o755)
-	}
+	// Create executor based on mode
+	var exec executor.Executor
+	if cfg.Mode == "local" {
+		logFn("using local execution mode")
+		exec, err = local.New(workspace, klaudiaDir)
+		if err != nil {
+			return nil, fmt.Errorf("creating local executor: %w", err)
+		}
+	} else {
+		// Docker mode (default)
+		home, _ := os.UserHomeDir()
+		claudeDir := filepath.Join(home, ".claude")
+		if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
+			os.MkdirAll(claudeDir, 0o755)
+		}
 
-	// Generate unique container name from project name + workspace hash
-	containerName := docker.ContainerName(cfg.ProjectName, workspace)
-	logFn("container name: %s", containerName)
+		containerName := docker.ContainerName(cfg.ProjectName, workspace)
+		logFn("container name: %s", containerName)
 
-	container, err := docker.NewContainer(
-		containerName,
-		cfg.Docker.Image,
-		workspace,
-		klaudiaDir,
-		claudeDir,
-		galphDir,
-		cfg.Docker.Memory,
-		cfg.Docker.Network,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("creating container: %w", err)
+		exec, err = docker.NewContainer(
+			containerName,
+			cfg.Docker.Image,
+			workspace,
+			klaudiaDir,
+			claudeDir,
+			galphDir,
+			cfg.Docker.Memory,
+			cfg.Docker.Network,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("creating container: %w", err)
+		}
 	}
 
 	return &Runner{
-		cfg:       cfg,
-		container: container,
-		store:     store,
-		log:       logFn,
+		cfg:   cfg,
+		exec:  exec,
+		store: store,
+		log:   logFn,
 	}, nil
 }
 
@@ -97,20 +108,22 @@ func (r *Runner) Run() error {
 		return fmt.Errorf("PRD not found at %s\n\nTo get started:\n  galph init --describe \"what you want to build\"   # generates PRD.md\n  galph init                                        # interactive setup\n  or create PRD.md manually", prdPath)
 	}
 
-	// Ensure Docker image exists
-	if err := r.ensureImage(); err != nil {
-		return err
+	// Docker-only: ensure image exists
+	if r.cfg.Mode != "local" {
+		if err := r.ensureImage(); err != nil {
+			return err
+		}
 	}
 
-	// Start container
-	r.log("starting container...")
-	if err := r.container.Start(); err != nil {
-		return fmt.Errorf("starting container: %w", err)
+	// Start executor
+	r.log("starting executor...")
+	if err := r.exec.Start(); err != nil {
+		return fmt.Errorf("starting executor: %w", err)
 	}
 	defer func() {
-		r.log("stopping container...")
-		r.container.Stop()
-		r.container.Remove()
+		r.log("stopping executor...")
+		r.exec.Stop()
+		r.exec.Remove()
 	}()
 
 	// Load or create state
@@ -286,17 +299,19 @@ func (r *Runner) PlanOnly() error {
 		return fmt.Errorf("PRD not found at %s\n\nTo get started:\n  galph init --describe \"what you want to build\"   # generates PRD.md\n  galph init                                        # interactive setup\n  or create PRD.md manually", prdPath)
 	}
 
-	if err := r.ensureImage(); err != nil {
-		return err
+	if r.cfg.Mode != "local" {
+		if err := r.ensureImage(); err != nil {
+			return err
+		}
 	}
 
-	r.log("starting container...")
-	if err := r.container.Start(); err != nil {
-		return fmt.Errorf("starting container: %w", err)
+	r.log("starting executor...")
+	if err := r.exec.Start(); err != nil {
+		return fmt.Errorf("starting executor: %w", err)
 	}
 	defer func() {
-		r.container.Stop()
-		r.container.Remove()
+		r.exec.Stop()
+		r.exec.Remove()
 	}()
 
 	display.PlanHeader()
@@ -375,16 +390,17 @@ Plan only the REMAINING work needed to fulfill the PRD.
 `, strings.Join(descriptions, "\n"))
 	}
 
+	wsPath := r.exec.WorkspacePath()
 	prompt := fmt.Sprintf(`You are a planning agent for an autonomous coding loop called galph.
 
 Read the PRD below and break it into discrete, independently-executable tasks.
 Each task should be completable in a single klaudia session (one context window).
 
-CRITICAL WORKSPACE RULE: Your current working directory is /workspace. This IS the project root.
+CRITICAL WORKSPACE RULE: Your current working directory is %s. This IS the project root.
 DO NOT create a subdirectory named "%s" or any other project-name directory.
 Files go directly in the current directory. For example:
-  CORRECT: cmd/server/main.go (creates /workspace/cmd/server/main.go)
-  WRONG:   %s/cmd/server/main.go (creates /workspace/%s/cmd/server/main.go)
+  CORRECT: cmd/server/main.go
+  WRONG:   %s/cmd/server/main.go
 
 Existing files in the workspace:
 %s
@@ -398,15 +414,14 @@ enough that a fresh klaudia instance can execute it without additional context.
 PRD:
 %s
 
-Respond with ONLY the JSON array, no markdown fencing or explanation.`, projectName, projectName, projectName, existingFiles, completedContext, string(prdContent))
+Respond with ONLY the JSON array, no markdown fencing or explanation.`, wsPath, projectName, projectName, existingFiles, completedContext, string(prdContent))
 
-	// Run klaudia in planning mode (klaudia is mounted at /klaudia)
-	cmd := []string{
-		"node", "/klaudia/dist/cli.js",
+	// Build klaudia command
+	cmd := append(r.exec.KlaudiaCmd(),
 		"--print", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
-	}
+	)
 
 	if r.cfg.DryRun {
 		r.log("  [dry-run] would run: %s", strings.Join(cmd, " "))
@@ -416,7 +431,7 @@ Respond with ONLY the JSON array, no markdown fencing or explanation.`, projectN
 	}
 
 	var output bytes.Buffer
-	execErr := r.container.ExecStream(cmd, &output)
+	execErr := r.exec.ExecStream(cmd, &output)
 
 	// Parse the stream-json output (even on exec error — may have partial results)
 	result, parseErr := parser.ParseStreamJSON(output.String())
@@ -487,17 +502,18 @@ func (r *Runner) executeIteration(iteration int, task *state.Task) (*state.Itera
 	// List existing files so klaudia sees what's already there
 	existingFiles := r.listWorkspaceFiles()
 
+	wsPath := r.exec.WorkspacePath()
 	prompt := fmt.Sprintf(`You are working on %s. Complete this task:
 
 Task: %s
 
-CRITICAL WORKSPACE RULE: Your current working directory (/workspace) IS the project root.
+CRITICAL WORKSPACE RULE: Your current working directory (%s) IS the project root.
 DO NOT create a directory called "%s" — you are already inside the project.
 All files must be created relative to the current directory. For example:
   CORRECT: Write to cmd/server/main.go
   WRONG:   Write to %s/cmd/server/main.go
 
-Before creating any file, run "ls" to confirm you are in /workspace and can see existing project files.
+Before creating any file, run "ls" to confirm you are in the project root and can see existing project files.
 
 Existing files in the workspace:
 %s
@@ -506,18 +522,17 @@ Additional rules:
 - Make minimal, focused changes%s
 - If you encounter an error you can't fix, explain what went wrong
 
-When done, summarize what you changed.`, projectName, task.Description, projectName, projectName, existingFiles, testInfo)
+When done, summarize what you changed.`, projectName, task.Description, wsPath, projectName, projectName, existingFiles, testInfo)
 
 	iterLog.Prompt = prompt
 
-	// klaudia is mounted at /klaudia, workspace is /workspace
-	cmd := []string{
-		"node", "/klaudia/dist/cli.js",
+	// Build klaudia command
+	cmd := append(r.exec.KlaudiaCmd(),
 		"--dangerously-skip-permissions",
 		"--print", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
-	}
+	)
 
 	if r.cfg.Model != "" {
 		cmd = append(cmd, "--model", r.cfg.Model)
@@ -533,7 +548,7 @@ When done, summarize what you changed.`, projectName, task.Description, projectN
 
 	r.log("  executing klaudia...")
 	var output bytes.Buffer
-	err := r.container.ExecStream(cmd, &output)
+	err := r.exec.ExecStream(cmd, &output)
 
 	// Parse output even if there was an error (partial results)
 	result, parseErr := parser.ParseStreamJSON(output.String())
@@ -559,12 +574,12 @@ When done, summarize what you changed.`, projectName, task.Description, projectN
 }
 
 func (r *Runner) testGate() (bool, error) {
-	if r.cfg.TestCommand == "" {
+	if r.cfg.TestCommand == "" || r.cfg.DryRun {
 		return true, nil
 	}
 
 	cmd := []string{"bash", "-c", r.cfg.TestCommand}
-	output, err := r.container.Exec(cmd, func(line string) {
+	output, err := r.exec.Exec(cmd, func(line string) {
 		if r.cfg.Verbose {
 			r.log("    test: %s", line)
 		}
@@ -577,11 +592,11 @@ func (r *Runner) testGate() (bool, error) {
 }
 
 // listWorkspaceFiles returns a listing of top-level files in the workspace.
-// This helps klaudia see that the project already exists at /workspace root.
 func (r *Runner) listWorkspaceFiles() string {
-	cmd := []string{"find", "/workspace", "-maxdepth", "2", "-not", "-path", "*/.*", "-not", "-path", "/workspace/node_modules/*"}
-	if r.container.IsRunning() {
-		output, err := r.container.Exec(cmd, nil)
+	wsPath := r.exec.WorkspacePath()
+	cmd := []string{"find", wsPath, "-maxdepth", "2", "-not", "-path", "*/.*", "-not", "-path", wsPath + "/node_modules/*"}
+	if r.exec.IsRunning() {
+		output, err := r.exec.Exec(cmd, nil)
 		if err == nil && output != "" {
 			return output
 		}
@@ -615,6 +630,6 @@ func (r *Runner) commitGate(iteration int, description string) {
 		{"git", "commit", "-m", msg, "--allow-empty"},
 	}
 	for _, cmd := range cmds {
-		r.container.Exec(cmd, nil)
+		r.exec.Exec(cmd, nil)
 	}
 }

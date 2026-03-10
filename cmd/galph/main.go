@@ -87,13 +87,23 @@ Run flags:
   --max-iterations N      Maximum iterations (default: 50)
   --model MODEL           Claude model to use (default: claude-sonnet-4-6)
   --test-command CMD      Test command to gate iterations
+  --local                 Run klaudia locally (no Docker container)
+  --mode MODE             Execution mode: "docker" (default) or "local"
   --dry-run               Simulate without executing
   --verbose               Show detailed output
   --image IMAGE           Docker image name (default: galph-klaudia)
 
+Execution modes:
+  docker (default)        Runs klaudia inside a Docker container with workspace
+                          mounted at /workspace. Requires Docker.
+  local                   Runs klaudia directly on the host. Required for
+                          platform-specific toolchains (Swift/Xcode, etc.)
+                          that can't run in a Linux container.
+
 Config:
   Place a .galphrc (JSON) in the project directory to set defaults.
-  CLI flags override .galphrc values.
+  CLI flags override .galphrc values. Set "mode": "local" in .galphrc
+  to default to local execution.
 `, version)
 }
 
@@ -104,6 +114,8 @@ func parseRunFlags(args []string) *config.Config {
 		cfg = config.DefaultConfig()
 	}
 
+	var localFlag bool
+
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	fs.StringVar(&cfg.Workspace, "workspace", cfg.Workspace, "")
 	fs.StringVar(&cfg.PRD, "prd", cfg.PRD, "")
@@ -111,6 +123,8 @@ func parseRunFlags(args []string) *config.Config {
 	fs.IntVar(&cfg.MaxConsecutiveFailures, "max-failures", cfg.MaxConsecutiveFailures, "")
 	fs.StringVar(&cfg.Model, "model", cfg.Model, "")
 	fs.StringVar(&cfg.TestCommand, "test-command", cfg.TestCommand, "")
+	fs.BoolVar(&localFlag, "local", false, "")
+	fs.StringVar(&cfg.Mode, "mode", cfg.Mode, "")
 	fs.BoolVar(&cfg.DryRun, "dry-run", cfg.DryRun, "")
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "")
 	fs.StringVar(&cfg.Docker.Image, "image", cfg.Docker.Image, "")
@@ -118,6 +132,11 @@ func parseRunFlags(args []string) *config.Config {
 	fs.StringVar(&cfg.Docker.Network, "network", cfg.Docker.Network, "")
 	fs.StringVar(&cfg.Docker.KlaudiaDir, "klaudia-dir", cfg.Docker.KlaudiaDir, "")
 	fs.Parse(args)
+
+	// --local is shorthand for --mode local
+	if localFlag {
+		cfg.Mode = "local"
+	}
 
 	return cfg
 }
@@ -431,6 +450,12 @@ func detectProject(dir string) *projectInfo {
 	// Check for git
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		info.hasGit = true
+	}
+
+	// Swift
+	if _, err := os.Stat(filepath.Join(dir, "Package.swift")); err == nil {
+		info.languages = append(info.languages, "Swift")
+		info.testCommand = "swift build && swift test"
 	}
 
 	// Go
