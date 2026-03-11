@@ -26,6 +26,7 @@ type Task struct {
 	Status      TaskStatus `json:"status"`
 	Iteration   int        `json:"iteration,omitempty"`
 	Error       string     `json:"error,omitempty"`
+	Source      string     `json:"source,omitempty"` // "prd" (default/""), "backlog", "refine"
 }
 
 // State holds the current galph run state.
@@ -183,4 +184,33 @@ func Summary(tasks []Task) string {
 		}
 	}
 	return fmt.Sprintf("%d/%d complete, %d failed", done, total, failed)
+}
+
+// IsPRDComplete returns true if all PRD tasks (Source "" or "prd") are complete.
+// Returns false if there are no PRD tasks.
+func IsPRDComplete(tasks []Task) bool {
+	hasPRD := false
+	for _, t := range tasks {
+		if t.Source == "" || t.Source == "prd" {
+			hasPRD = true
+			if t.Status != TaskComplete {
+				return false
+			}
+		}
+	}
+	return hasPRD
+}
+
+// NextRefineID scans existing tasks for the highest refine-NNN ID and returns the next number.
+func NextRefineID(tasks []Task) int {
+	max := 0
+	for _, t := range tasks {
+		var n int
+		if _, err := fmt.Sscanf(t.ID, "refine-%d", &n); err == nil {
+			if n > max {
+				max = n
+			}
+		}
+	}
+	return max + 1
 }

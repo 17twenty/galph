@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"galph/internal/backlog"
 	"galph/internal/config"
 	"galph/internal/display"
 	"galph/internal/docker"
@@ -23,14 +24,16 @@ import (
 
 // Runner orchestrates the galph loop.
 type Runner struct {
-	cfg  *config.Config
-	exec executor.Executor
-	store *state.Store
-	log   func(format string, args ...any)
+	cfg     *config.Config
+	exec    executor.Executor
+	store   *state.Store
+	display display.Renderer
+	dstate  *display.DisplayState
+	log     func(format string, args ...any)
 }
 
 // New creates a runner from config.
-func New(cfg *config.Config, logFn func(string, ...any)) (*Runner, error) {
+func New(cfg *config.Config, renderer display.Renderer, logFn func(string, ...any)) (*Runner, error) {
 	// Resolve paths
 	workspace := cfg.Workspace
 	if !filepath.IsAbs(workspace) {
@@ -89,18 +92,33 @@ func New(cfg *config.Config, logFn func(string, ...any)) (*Runner, error) {
 		}
 	}
 
+	// Resolve mode string for display
+	mode := cfg.Mode
+	if mode == "" {
+		mode = "docker"
+	}
+
+	dstate := display.NewDisplayState("0.2.0", cfg.Model, mode, workspace, cfg.MaxIterations)
+
 	return &Runner{
-		cfg:   cfg,
-		exec:  exec,
-		store: store,
-		log:   logFn,
+		cfg:     cfg,
+		exec:    exec,
+		store:   store,
+		display: renderer,
+		dstate:  dstate,
+		log:     logFn,
 	}, nil
 }
 
 // Run executes the full galph loop: plan then execute.
 func (r *Runner) Run() error {
-	runStart := time.Now()
-	display.Banner("0.2.0", r.cfg.Workspace, r.cfg.Model)
+	ds := r.dstate
+	ds.RunStart = time.Now()
+
+	r.display.Init(ds)
+	defer r.display.Close()
+
+	r.display.RenderBanner(ds)
 
 	// Check PRD exists
 	prdPath := r.cfg.ResolvePRD()
@@ -132,6 +150,10 @@ func (r *Runner) Run() error {
 		return fmt.Errorf("loading state: %w", err)
 	}
 
+	// Sync persisted metrics into display state
+	ds.TotalCost = st.TotalCostUSD
+	ds.Iteration = st.Iteration
+
 	// Compute current hash of planning inputs
 	currentHash, err := hasher.HashPlanInputs(r.cfg.Workspace, r.cfg.ResolvePRD())
 	if err != nil {
@@ -142,7 +164,11 @@ func (r *Runner) Run() error {
 	tasks, loadErr := r.store.LoadPlan()
 	if loadErr != nil || len(tasks) == 0 {
 		// Case 1: No existing plan — create one
-		display.PlanHeader()
+		ds.CurrentPhase = display.PhasePlanning
+		r.display.RenderPhaseChange(ds)
+		entry := ds.AppendLog(display.PhasePlanning, "analyze PRD", "", "")
+		r.display.RenderLog(ds, entry)
+
 		tasks, err = r.planPhase(nil)
 		if err != nil {
 			return fmt.Errorf("plan phase: %w", err)
@@ -154,7 +180,11 @@ func (r *Runner) Run() error {
 		st.PlanInputsHash = currentHash
 		st.PlanCreatedAt = time.Now()
 		r.store.SaveState(st)
-		display.PlanResult(tasks)
+
+		ds.Tasks = display.TasksFromState(tasks)
+		entry = ds.AppendLog(display.PhasePlanning, "parse PRD", fmt.Sprintf("%d tasks", len(tasks)), "done")
+		r.display.RenderLog(ds, entry)
+		r.display.RenderPlanResult(ds)
 
 	} else if st.PlanInputsHash == "" {
 		// Case 2: Upgrading from older galph — adopt hash silently, resume
@@ -163,14 +193,20 @@ func (r *Runner) Run() error {
 		r.store.SaveState(st)
 		r.log("resuming with existing plan (%s)", state.Summary(tasks))
 		st.Tasks = tasks
-		display.ProgressBar(tasks)
+		ds.Tasks = display.TasksFromState(tasks)
+		ds.SyncCountsFromTasks()
+		r.display.RenderPlanResult(ds)
 
 	} else if st.PlanInputsHash != currentHash {
 		// Case 3: Plan exists but inputs changed — additive replan
 		completedTasks := state.CompletedTasks(tasks)
 		r.log("plan inputs changed (PRD/CLAUDE.md/.galphrc modified), replanning...")
 		r.log("  preserving %d completed tasks", len(completedTasks))
-		display.ReplanHeader(len(completedTasks))
+
+		ds.CurrentPhase = display.PhasePlanning
+		r.display.RenderPhaseChange(ds)
+		entry := ds.AppendLog(display.PhasePlanning, "replan", fmt.Sprintf("preserving %d completed", len(completedTasks)), "")
+		r.display.RenderLog(ds, entry)
 
 		newTasks, err := r.planPhase(completedTasks)
 		if err != nil {
@@ -187,36 +223,59 @@ func (r *Runner) Run() error {
 		st.PlanCreatedAt = time.Now()
 		st.ConsecutiveFailures = 0
 		r.store.SaveState(st)
-		display.PlanResult(newTasks)
+
+		ds.Tasks = display.TasksFromState(tasks)
+		ds.SyncCountsFromTasks()
+		entry = ds.AppendLog(display.PhasePlanning, "replan", fmt.Sprintf("%d new tasks", len(newTasks)), "done")
+		r.display.RenderLog(ds, entry)
+		r.display.RenderPlanResult(ds)
 
 	} else {
 		// Case 4: Plan exists and inputs unchanged — resume
 		r.log("resuming with existing plan (%s)", state.Summary(tasks))
 		st.Tasks = tasks
-		display.ProgressBar(tasks)
+		ds.Tasks = display.TasksFromState(tasks)
+		ds.SyncCountsFromTasks()
+		r.display.RenderPlanResult(ds)
 	}
 
 	// Execute loop
+	backlogPath := filepath.Join(r.cfg.Workspace, "BACKLOG.md")
+
 	for i := 0; i < r.cfg.MaxIterations; i++ {
-		// Check if all done
+		// Check if all current tasks are done — if so, try backlog pickup
 		if state.AllComplete(tasks) {
-			display.Completion(tasks, st.TotalCostUSD, time.Since(runStart))
-			return nil
+			tasks = r.pickupBacklog(tasks, backlogPath)
+			if state.AllComplete(tasks) {
+				// Nothing left to do
+				ds.PRDComplete = state.IsPRDComplete(tasks)
+				ds.HasBacklog = backlog.Exists(backlogPath)
+				ds.CurrentPhase = display.PhaseComplete
+				ds.Tasks = display.TasksFromState(tasks)
+				r.display.RenderCompletion(ds)
+				return nil
+			}
+			// Update display with new backlog tasks
+			ds.Tasks = display.TasksFromState(tasks)
+			r.display.RenderPlanResult(ds)
 		}
 
 		// Check consecutive failures
 		if st.ConsecutiveFailures >= r.cfg.MaxConsecutiveFailures {
-			display.FailureSummary(
-				fmt.Sprintf("too many consecutive failures (%d)", st.ConsecutiveFailures),
-				tasks, st.TotalCostUSD,
-			)
+			ds.CurrentPhase = display.PhaseFailed
+			ds.StopReason = fmt.Sprintf("too many consecutive failures (%d)", st.ConsecutiveFailures)
+			r.display.RenderCompletion(ds)
 			return fmt.Errorf("too many consecutive failures (%d), stopping", st.ConsecutiveFailures)
 		}
 
 		// Pick next task
 		task := state.NextTask(tasks)
 		if task == nil {
-			display.Completion(tasks, st.TotalCostUSD, time.Since(runStart))
+			ds.PRDComplete = state.IsPRDComplete(tasks)
+			ds.HasBacklog = backlog.Exists(backlogPath)
+			ds.CurrentPhase = display.PhaseComplete
+			ds.Tasks = display.TasksFromState(tasks)
+			r.display.RenderCompletion(ds)
 			return nil
 		}
 
@@ -225,10 +284,19 @@ func (r *Runner) Run() error {
 		task.Iteration = st.Iteration
 		r.store.SaveState(st)
 
-		display.IterationHeader(st.Iteration, r.cfg.MaxIterations, task)
+		// Update display state for this iteration
+		ds.Iteration = st.Iteration
+		ds.Tasks = display.TasksFromState(tasks)
+		ds.ActiveTaskIdx = r.findTaskIdx(tasks, task.ID)
+		ds.IterStart = time.Now()
+		ds.CurrentPhase = display.PhaseExecuting
+
+		r.display.RenderTaskStart(ds)
+
+		entry := ds.AppendLog(display.PhaseExecuting, "klaudia", task.Description, "")
+		r.display.RenderLog(ds, entry)
 
 		// Start progress ticker
-		iterStart := time.Now()
 		done := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
@@ -238,7 +306,7 @@ func (r *Runner) Run() error {
 				case <-done:
 					return
 				case <-ticker.C:
-					display.IterationProgress(time.Since(iterStart))
+					r.display.RenderProgress(ds)
 				}
 			}
 		}()
@@ -251,47 +319,77 @@ func (r *Runner) Run() error {
 			task.Status = state.TaskFailed
 			task.Error = err.Error()
 			st.ConsecutiveFailures++
+			ds.FailCount++
 			iterLog.Error = err.Error()
-			display.IterationResult(iterLog, err)
+
+			entry = ds.AppendLog(display.PhaseExecuting, "klaudia", task.Description, "failed")
+			r.display.RenderLog(ds, entry)
 		} else {
 			// Run test gate
+			ds.CurrentPhase = display.PhaseTesting
+			entry = ds.AppendLog(display.PhaseTesting, r.cfg.TestCommand, task.ID, "")
+			r.display.RenderLog(ds, entry)
+
 			testPassed, testErr := r.testGate()
 			iterLog.TestPassed = testPassed
 
 			if testPassed {
 				task.Status = state.TaskComplete
 				st.ConsecutiveFailures = 0
-				display.IterationResult(iterLog, nil)
+				ds.PassCount++
+
+				entry = ds.AppendLog(display.PhaseTesting, "tests", task.ID, "passed")
+				r.display.RenderLog(ds, entry)
 
 				// Git commit
 				if !r.cfg.DryRun {
+					ds.CurrentPhase = display.PhaseCommitting
+					entry = ds.AppendLog(display.PhaseCommitting, "git commit", fmt.Sprintf("iteration %d", st.Iteration), "")
+					r.display.RenderLog(ds, entry)
 					r.commitGate(st.Iteration, task.Description)
+				}
+
+				// Mark backlog item done if applicable
+				if task.Source == "backlog" {
+					r.markBacklogDone(backlogPath, task)
 				}
 			} else {
 				task.Status = state.TaskFailed
 				task.Error = fmt.Sprintf("test failed: %v", testErr)
 				st.ConsecutiveFailures++
+				ds.FailCount++
 				iterLog.Error = task.Error
-				display.IterationResult(iterLog, fmt.Errorf("tests failed: %v", testErr))
+
+				entry = ds.AppendLog(display.PhaseTesting, "tests", task.ID, "failed")
+				r.display.RenderLog(ds, entry)
 			}
 		}
 
 		st.TotalCostUSD += iterLog.CostUSD
+		ds.TotalCost = st.TotalCostUSD
+		ds.Tasks = display.TasksFromState(tasks)
+
 		r.store.SaveIterationLog(iterLog)
 		r.store.SaveState(st)
 		r.store.SavePlan(tasks)
 
-		display.ProgressBar(tasks)
-		display.CostSummary(st.TotalCostUSD, st.Iteration)
+		r.display.RenderIterationResult(ds)
 	}
 
-	display.FailureSummary("max iterations reached", tasks, st.TotalCostUSD)
+	ds.CurrentPhase = display.PhaseFailed
+	ds.StopReason = "max iterations reached"
+	r.display.RenderCompletion(ds)
 	return nil
 }
 
 // PlanOnly runs just the planning phase.
 func (r *Runner) PlanOnly() error {
-	display.Banner("0.2.0", r.cfg.Workspace, r.cfg.Model)
+	ds := r.dstate
+
+	r.display.Init(ds)
+	defer r.display.Close()
+
+	r.display.RenderBanner(ds)
 
 	// Check PRD exists
 	prdPath := r.cfg.ResolvePRD()
@@ -314,7 +412,11 @@ func (r *Runner) PlanOnly() error {
 		r.exec.Remove()
 	}()
 
-	display.PlanHeader()
+	ds.CurrentPhase = display.PhasePlanning
+	r.display.RenderPhaseChange(ds)
+	entry := ds.AppendLog(display.PhasePlanning, "analyze PRD", "", "")
+	r.display.RenderLog(ds, entry)
+
 	tasks, err := r.planPhase(nil)
 	if err != nil {
 		return fmt.Errorf("plan phase: %w", err)
@@ -335,9 +437,75 @@ func (r *Runner) PlanOnly() error {
 	st.Tasks = tasks
 	r.store.SaveState(st)
 
-	display.PlanResult(tasks)
+	ds.Tasks = display.TasksFromState(tasks)
+	entry = ds.AppendLog(display.PhasePlanning, "parse PRD", fmt.Sprintf("%d tasks", len(tasks)), "done")
+	r.display.RenderLog(ds, entry)
+	r.display.RenderPlanResult(ds)
 	r.log("plan saved to .galph/plan.json")
 	return nil
+}
+
+// findTaskIdx returns the index of the task with the given ID, or -1.
+func (r *Runner) findTaskIdx(tasks []state.Task, id string) int {
+	for i, t := range tasks {
+		if t.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// pickupBacklog checks BACKLOG.md for pending items and appends them as tasks.
+// Only picks up items when all current tasks are complete.
+func (r *Runner) pickupBacklog(tasks []state.Task, backlogPath string) []state.Task {
+	if !state.IsPRDComplete(tasks) {
+		return tasks
+	}
+
+	items, _, err := backlog.Parse(backlogPath)
+	if err != nil {
+		r.log("warning: could not parse backlog: %v", err)
+		return tasks
+	}
+
+	pending := backlog.PendingItems(items)
+	if len(pending) == 0 {
+		return tasks
+	}
+
+	r.log("found %d pending backlog items", len(pending))
+	for _, item := range pending {
+		id := fmt.Sprintf("refine-%03d", state.NextRefineID(tasks))
+		tasks = append(tasks, state.Task{
+			ID:          id,
+			Description: item.Description,
+			Status:      state.TaskPending,
+			Source:      "backlog",
+		})
+	}
+
+	// Persist the expanded task list
+	r.store.SavePlan(tasks)
+	return tasks
+}
+
+// markBacklogDone marks a backlog item as done in BACKLOG.md.
+func (r *Runner) markBacklogDone(backlogPath string, task *state.Task) {
+	items, lines, err := backlog.Parse(backlogPath)
+	if err != nil {
+		r.log("warning: could not parse backlog for marking done: %v", err)
+		return
+	}
+
+	// Find the matching pending item by description
+	for _, item := range items {
+		if !item.Done && item.Description == task.Description {
+			if err := backlog.MarkDone(backlogPath, lines, item.Line, task.ID, task.Iteration); err != nil {
+				r.log("warning: could not mark backlog item done: %v", err)
+			}
+			return
+		}
+	}
 }
 
 func (r *Runner) ensureImage() error {
@@ -489,41 +657,7 @@ func (r *Runner) executeIteration(iteration int, task *state.Task) (*state.Itera
 		TaskID:    task.ID,
 	}
 
-	projectName := r.cfg.ProjectName
-	if projectName == "" {
-		projectName = "the project"
-	}
-
-	testInfo := ""
-	if r.cfg.TestCommand != "" {
-		testInfo = fmt.Sprintf("\n- After making changes, verify with: %s", r.cfg.TestCommand)
-	}
-
-	// List existing files so klaudia sees what's already there
-	existingFiles := r.listWorkspaceFiles()
-
-	wsPath := r.exec.WorkspacePath()
-	prompt := fmt.Sprintf(`You are working on %s. Complete this task:
-
-Task: %s
-
-CRITICAL WORKSPACE RULE: Your current working directory (%s) IS the project root.
-DO NOT create a directory called "%s" — you are already inside the project.
-All files must be created relative to the current directory. For example:
-  CORRECT: Write to cmd/server/main.go
-  WRONG:   Write to %s/cmd/server/main.go
-
-Before creating any file, run "ls" to confirm you are in the project root and can see existing project files.
-
-Existing files in the workspace:
-%s
-
-Additional rules:
-- Make minimal, focused changes%s
-- If you encounter an error you can't fix, explain what went wrong
-
-When done, summarize what you changed.`, projectName, task.Description, wsPath, projectName, projectName, existingFiles, testInfo)
-
+	prompt := r.buildExecutionPrompt(task)
 	iterLog.Prompt = prompt
 
 	// Build klaudia command
@@ -589,6 +723,63 @@ func (r *Runner) testGate() (bool, error) {
 		return false, fmt.Errorf("%s\n%s", err, output)
 	}
 	return true, nil
+}
+
+// buildExecutionPrompt generates the klaudia prompt for a task.
+// PRD tasks get the standard "complete this task" prompt.
+// Refinement tasks (backlog/refine) get a targeted "fix this issue" prompt.
+func (r *Runner) buildExecutionPrompt(task *state.Task) string {
+	projectName := r.cfg.ProjectName
+	if projectName == "" {
+		projectName = "the project"
+	}
+
+	testInfo := ""
+	if r.cfg.TestCommand != "" {
+		testInfo = fmt.Sprintf("\n- After making changes, verify with: %s", r.cfg.TestCommand)
+	}
+
+	existingFiles := r.listWorkspaceFiles()
+	wsPath := r.exec.WorkspacePath()
+
+	wsRule := fmt.Sprintf(`CRITICAL WORKSPACE RULE: Your current working directory (%s) IS the project root.
+DO NOT create a directory called "%s" — you are already inside the project.
+All files must be created relative to the current directory. For example:
+  CORRECT: Write to cmd/server/main.go
+  WRONG:   Write to %s/cmd/server/main.go
+
+Before creating any file, run "ls" to confirm you are in the project root and can see existing project files.
+
+Existing files in the workspace:
+%s`, wsPath, projectName, projectName, existingFiles)
+
+	if task.Source == "backlog" || task.Source == "refine" {
+		return fmt.Sprintf(`You are working on %s. This is a refinement to an existing, working codebase.
+
+Issue: %s
+
+%s
+
+Approach:
+1. First, read the relevant code to understand what exists
+2. Make the minimal change needed to address the issue
+3. Do NOT restructure or refactor unrelated code%s
+4. If you encounter an error you can't fix, explain what went wrong
+
+When done, summarize what you changed and why.`, projectName, task.Description, wsRule, testInfo)
+	}
+
+	return fmt.Sprintf(`You are working on %s. Complete this task:
+
+Task: %s
+
+%s
+
+Additional rules:
+- Make minimal, focused changes%s
+- If you encounter an error you can't fix, explain what went wrong
+
+When done, summarize what you changed.`, projectName, task.Description, wsRule, testInfo)
 }
 
 // listWorkspaceFiles returns a listing of top-level files in the workspace.

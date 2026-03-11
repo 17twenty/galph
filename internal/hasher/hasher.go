@@ -51,3 +51,15 @@ func HashPlanInputs(workspace, prdPath string) (string, error) {
 	}
 	return HashFiles(paths)
 }
+
+// HashAllInputs includes BACKLOG.md in the hash, for use when PRD tasks
+// are complete and backlog changes should trigger re-evaluation.
+func HashAllInputs(workspace, prdPath string) (string, error) {
+	paths := []string{
+		prdPath,
+		filepath.Join(workspace, "CLAUDE.md"),
+		filepath.Join(workspace, ".galphrc"),
+		filepath.Join(workspace, "BACKLOG.md"),
+	}
+	return HashFiles(paths)
+}

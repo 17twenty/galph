@@ -21,7 +21,9 @@ import (
 	"strconv"
 	"strings"
 
+	"galph/internal/backlog"
 	"galph/internal/config"
+	"galph/internal/display"
 	"galph/internal/hasher"
 	"galph/internal/runner"
 	"galph/internal/state"
@@ -44,6 +46,8 @@ func main() {
 		cmdRun(os.Args[2:])
 	case "plan":
 		cmdPlan(os.Args[2:])
+	case "refine":
+		cmdRefine(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "logs":
@@ -67,6 +71,7 @@ Usage:
   galph init [flags]      Add galph to an existing project (current directory)
   galph run [flags]       Run the full plan+execute loop
   galph plan [flags]      Run only the planning phase
+  galph refine ["..."]    Refine the codebase (inline, file, or interactive)
   galph status [flags]    Show current run state
   galph logs [N]          Show iteration log (latest or specific)
 
@@ -99,6 +104,15 @@ Execution modes:
   local                   Runs klaudia directly on the host. Required for
                           platform-specific toolchains (Swift/Xcode, etc.)
                           that can't run in a Linux container.
+
+Refine:
+  Post-PRD refinements, bug fixes, and tweaks. Three modes:
+  galph refine "fix the flicker"   Inline: single refinement
+  galph refine --file FIXES.md     File: batch refinements
+  galph refine                     Interactive: REPL mode
+
+  Completed refinements are recorded in BACKLOG.md.
+  Pending BACKLOG.md items are also picked up by 'galph run'.
 
 Config:
   Place a .galphrc (JSON) in the project directory to set defaults.
@@ -606,8 +620,9 @@ func appendGitignore(dir string) {
 func cmdRun(args []string) {
 	cfg := parseRunFlags(args)
 	logFn := makeLogger(cfg.Verbose)
+	renderer := display.NewAnsiRenderer()
 
-	r, err := runner.New(cfg, logFn)
+	r, err := runner.New(cfg, renderer, logFn)
 	if err != nil {
 		fatal("setup: %v", err)
 	}
@@ -620,8 +635,9 @@ func cmdRun(args []string) {
 func cmdPlan(args []string) {
 	cfg := parseRunFlags(args)
 	logFn := makeLogger(cfg.Verbose)
+	renderer := display.NewAnsiRenderer()
 
-	r, err := runner.New(cfg, logFn)
+	r, err := runner.New(cfg, renderer, logFn)
 	if err != nil {
 		fatal("setup: %v", err)
 	}
@@ -629,6 +645,86 @@ func cmdPlan(args []string) {
 	if err := r.PlanOnly(); err != nil {
 		fatal("plan: %v", err)
 	}
+}
+
+func cmdRefine(args []string) {
+	fs := flag.NewFlagSet("refine", flag.ExitOnError)
+	filePath := fs.String("file", "", "Read refinements from a file")
+	workspace := fs.String("workspace", ".", "")
+	fs.Parse(args)
+
+	cfg := parseRunFlags([]string{"--workspace", *workspace})
+	logFn := makeLogger(cfg.Verbose)
+	renderer := display.NewAnsiRenderer()
+
+	// Ensure BACKLOG.md exists
+	backlogPath := filepath.Join(cfg.Workspace, "BACKLOG.md")
+	backlog.EnsureExists(backlogPath)
+
+	r, err := runner.New(cfg, renderer, logFn)
+	if err != nil {
+		fatal("setup: %v", err)
+	}
+
+	remaining := fs.Args()
+
+	if len(remaining) > 0 {
+		// Inline mode: galph refine "fix the flicker"
+		desc := strings.Join(remaining, " ")
+		if err := r.RunRefinement(desc); err != nil {
+			fatal("refine: %v", err)
+		}
+	} else if *filePath != "" {
+		// File mode: galph refine --file FIXES.md
+		descriptions, err := parseRefineFile(*filePath)
+		if err != nil {
+			fatal("reading refinements file: %v", err)
+		}
+		if len(descriptions) == 0 {
+			fatal("no refinement items found in %s", *filePath)
+		}
+		if err := r.RunRefinements(descriptions); err != nil {
+			fatal("refine: %v", err)
+		}
+	} else if isInteractive() {
+		// REPL mode
+		fmt.Println("Entering interactive refine mode. Type a refinement and press Enter.")
+		fmt.Println("Type 'done' or Ctrl-D to exit.")
+		if err := r.RunRefineREPL(); err != nil {
+			fatal("refine: %v", err)
+		}
+	} else {
+		fatal("usage: galph refine \"description\" | galph refine --file FILE | galph refine (interactive)")
+	}
+}
+
+// parseRefineFile reads refinement descriptions from a file.
+// Supports markdown checkboxes ([ ] item) and plain lines.
+func parseRefineFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var descriptions []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		// Skip empty lines and headers
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Strip markdown checkbox prefix
+		line = strings.TrimPrefix(line, "- [ ] ")
+		line = strings.TrimPrefix(line, "- ")
+		// Skip completed items
+		if strings.HasPrefix(line, "[x]") {
+			continue
+		}
+		if line != "" {
+			descriptions = append(descriptions, line)
+		}
+	}
+	return descriptions, nil
 }
 
 func cmdStatus(args []string) {
